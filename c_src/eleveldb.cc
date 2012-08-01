@@ -26,6 +26,7 @@
 #include "leveldb/write_batch.h"
 #include "leveldb/cache.h"
 #include "leveldb/filter_policy.h"
+#include "leveldb/gc_manager.h"
 
 static ErlNifResourceType* eleveldb_db_RESOURCE;
 static ErlNifResourceType* eleveldb_itr_RESOURCE;
@@ -96,6 +97,7 @@ static ErlNifFunc nif_funcs[] =
     {"destroy", 2, eleveldb_destroy},
     {"repair", 2, eleveldb_repair},
     {"is_empty", 1, eleveldb_is_empty},
+    {"gc",4, eleveldb_gc},
 };
 
 ERL_NIF_TERM parse_open_option(ErlNifEnv* env, ERL_NIF_TERM item, leveldb::Options& opts)
@@ -616,6 +618,29 @@ ERL_NIF_TERM eleveldb_is_empty(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv
     {
         return enif_make_badarg(env);
     }
+}
+
+
+ERL_NIF_TERM eleveldb_gc(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+{
+  //eleveldb_db_handle* handle;
+    char prefix[100];
+    char first[100];
+    char end[100];
+    if (
+        enif_get_string(env, argv[1], prefix, sizeof(prefix), ERL_NIF_LATIN1) &&
+	enif_get_string(env, argv[2], first, sizeof(first), ERL_NIF_LATIN1) &&
+	enif_get_string(env, argv[3], end, sizeof(end), ERL_NIF_LATIN1) 
+        )
+    {
+      // leveldb::DB* db = handle->db;
+      std::string p1= std::string(prefix);
+      std::string f= std::string(first);
+      std::string e= std::string(end);
+      leveldb::gc::GcFactory::getGcManager()->addKeyRange(p1,f,e);
+       return ATOM_OK;
+    }
+    return ATOM_ERROR;
 }
 
 static void eleveldb_db_resource_cleanup(ErlNifEnv* env, void* arg)

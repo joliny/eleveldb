@@ -31,7 +31,9 @@
          status/2,
          destroy/2,
          repair/2,
-         is_empty/1]).
+         is_empty/1,
+	 gc/4
+]).
 
 -export([option_types/1,
          validate_options/2]).
@@ -91,6 +93,10 @@ init() ->
 -opaque db_ref() :: binary().
 
 -opaque itr_ref() :: binary().
+
+-spec gc(db_ref(),string(), string(),string()) -> ok | error.
+gc(_Name, _Prefix,_Start,_End) ->
+    erlang:nif_error({error, not_loaded}).
 
 -spec open(string(), open_options()) -> {ok, db_ref()} | {error, any()}.
 open(_Name, _Opts) ->
