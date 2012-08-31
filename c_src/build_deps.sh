@@ -8,7 +8,7 @@ if [ `uname -s` = 'SunOS' -a "${POSIX_SHELL}" != "true" ]; then
 fi
 unset POSIX_SHELL # clear it so if we invoke other scripts, they run as ksh as well
 
-LEVELDB_VSN="gc_manager_dev" # June 25 merge w/ mv-write-throttle2
+LEVELDB_VSN="master" # June 25 merge w/ mv-write-throttle2
 SNAPPY_VSN="1.0.4"
 
 set -e
