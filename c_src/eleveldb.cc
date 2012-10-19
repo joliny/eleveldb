@@ -26,7 +26,7 @@
 #include "leveldb/write_batch.h"
 #include "leveldb/cache.h"
 #include "leveldb/filter_policy.h"
-#include "leveldb/gc_manager.h"
+#include "util/zab_comparator.h"
 
 static ErlNifResourceType* eleveldb_db_RESOURCE;
 static ErlNifResourceType* eleveldb_itr_RESOURCE;
@@ -84,6 +84,9 @@ static ERL_NIF_TERM ATOM_COMPRESSION;
 static ERL_NIF_TERM ATOM_ERROR_DB_REPAIR;
 static ERL_NIF_TERM ATOM_USE_BLOOMFILTER;
 
+static ERL_NIF_TERM ATOM_COMPARATOR;
+static ERL_NIF_TERM ATOM_COMPARATOR_ZAB;
+static ERL_NIF_TERM ATOM_COMPARATOR_BUCKET_SIZE;
 static ErlNifFunc nif_funcs[] =
 {
     {"open", 2, eleveldb_open},
@@ -97,7 +100,7 @@ static ErlNifFunc nif_funcs[] =
     {"destroy", 2, eleveldb_destroy},
     {"repair", 2, eleveldb_repair},
     {"is_empty", 1, eleveldb_is_empty},
-    {"gc",4, eleveldb_gc},
+   
 };
 
 ERL_NIF_TERM parse_open_option(ErlNifEnv* env, ERL_NIF_TERM item, leveldb::Options& opts)
@@ -159,12 +162,20 @@ ERL_NIF_TERM parse_open_option(ErlNifEnv* env, ERL_NIF_TERM item, leveldb::Optio
             // By default, we want to use a 10-bit-per-key bloom filter on a
             // per-table basis. We only disable it if explicitly asked. Alternatively,
             // one can provide a value for # of bits-per-key.
-            unsigned long bfsize = 10;
+	  unsigned long bfsize = 10;
             if (option[1] == ATOM_TRUE || enif_get_ulong(env, option[1], &bfsize))
             {
                 opts.filter_policy = leveldb::NewBloomFilterPolicy(bfsize);
             }
         }
+	else if(option[0]==ATOM_COMPARATOR){
+	  unsigned long bucket_size =1;
+	  if(option[1] == ATOM_COMPARATOR_ZAB){
+	    //TODO free ZabCmp in destroy
+	    zab::comparator::ZabComparatorImpl * ZabCmp = new zab::comparator::ZabComparatorImpl(bucket_size);
+	    opts.comparator = ZabCmp;
+	  }
+	}
     }
 
     return ATOM_OK;
@@ -621,28 +632,6 @@ ERL_NIF_TERM eleveldb_is_empty(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv
 }
 
 
-ERL_NIF_TERM eleveldb_gc(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
-{
-  //eleveldb_db_handle* handle;
-    char prefix[100];
-    char first[100];
-    char end[100];
-    if (
-        enif_get_string(env, argv[1], prefix, sizeof(prefix), ERL_NIF_LATIN1) &&
-	enif_get_string(env, argv[2], first, sizeof(first), ERL_NIF_LATIN1) &&
-	enif_get_string(env, argv[3], end, sizeof(end), ERL_NIF_LATIN1) 
-        )
-    {
-      // leveldb::DB* db = handle->db;
-      std::string p1= std::string(prefix);
-      std::string f= std::string(first);
-      std::string e= std::string(end);
-      leveldb::gc::GcFactory::getGcManager()->addKeyRange(p1,f,e);
-       return ATOM_OK;
-    }
-    return ATOM_ERROR;
-}
-
 static void eleveldb_db_resource_cleanup(ErlNifEnv* env, void* arg)
 {
     // Delete any dynamically allocated memory stored in eleveldb_db_handle
@@ -726,6 +715,9 @@ static int on_load(ErlNifEnv* env, void** priv_data, ERL_NIF_TERM load_info)
     ATOM(ATOM_KEYS_ONLY, "keys_only");
     ATOM(ATOM_COMPRESSION, "compression");
     ATOM(ATOM_USE_BLOOMFILTER, "use_bloomfilter");
+    ATOM(ATOM_COMPARATOR,"comparator");
+    ATOM(ATOM_COMPARATOR_ZAB,"zab");
+    ATOM(ATOM_COMPARATOR_BUCKET_SIZE,"bucket_size");
     return 0;
 }
 
