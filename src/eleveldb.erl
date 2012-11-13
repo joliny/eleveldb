@@ -32,7 +32,10 @@
          destroy/2,
          repair/2,
          is_empty/1,
-	 gc/4
+	 gc/4,
+	 get_gc/3,
+	 put_gc/4,
+	 write_gc/3
 ]).
 
 -export([option_types/1,
@@ -106,9 +109,15 @@ open(_Name, _Opts) ->
 get(_Ref, _Key, _Opts) ->
     erlang:nif_error({error, not_loaded}).
 
+get_gc(_Ref, _Key, _Opts) ->
+    erlang:nif_error({error, not_loaded}).
+
 -spec put(db_ref(), binary(), binary(), write_options()) -> ok | {error, any()}.
 put(Ref, Key, Value, Opts) ->
     write(Ref, [{put, Key, Value}], Opts).
+
+put_gc(Ref, Key, Value, Opts) ->
+    write_gc(Ref, [{put, Key, Value}], Opts).
 
 -spec delete(db_ref(), binary(), write_options()) -> ok | {error, any()}.
 delete(Ref, Key, Opts) ->
@@ -116,6 +125,9 @@ delete(Ref, Key, Opts) ->
 
 -spec write(db_ref(), write_actions(), write_options()) -> ok | {error, any()}.
 write(_Ref, _Updates, _Opts) ->
+    erlang:nif_error({error, not_loaded}).
+
+write_gc(_Ref, _Updates, _Opts) ->
     erlang:nif_error({error, not_loaded}).
 
 -spec iterator(db_ref(), read_options()) -> {ok, itr_ref()}.

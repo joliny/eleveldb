@@ -27,14 +27,17 @@
 #include "leveldb/cache.h"
 #include "leveldb/filter_policy.h"
 #include "util/zab_comparator.h"
+#include <stdio.h>
 
 static ErlNifResourceType* eleveldb_db_RESOURCE;
 static ErlNifResourceType* eleveldb_itr_RESOURCE;
 
 typedef struct
 {
-    leveldb::DB* db;
-    leveldb::Options options;
+  leveldb::DB* db;
+  leveldb::Options options;
+  leveldb::DB* gc_db;
+  leveldb::Options gc_options;
 } eleveldb_db_handle;
 
 typedef struct
@@ -100,6 +103,8 @@ static ErlNifFunc nif_funcs[] =
     {"destroy", 2, eleveldb_destroy},
     {"repair", 2, eleveldb_repair},
     {"is_empty", 1, eleveldb_is_empty},
+    {"get_gc", 3, eleveldb_get_gc},
+    {"write_gc", 3, eleveldb_write_gc},
    
 };
 
@@ -172,8 +177,21 @@ ERL_NIF_TERM parse_open_option(ErlNifEnv* env, ERL_NIF_TERM item, leveldb::Optio
 	  unsigned long bucket_size =1;
 	  if(option[1] == ATOM_COMPARATOR_ZAB){
 	    //TODO free ZabCmp in destroy
-	    zab::comparator::ZabComparatorImpl * ZabCmp = new zab::comparator::ZabComparatorImpl(bucket_size);
-	    opts.comparator = ZabCmp;
+	    leveldb::Options opt2;
+	    leveldb::DB* gc_db;
+	    opt2.create_if_missing=true;
+	    char name [4096];
+	    enif_get_string(env, option[2], name, sizeof(name), ERL_NIF_LATIN1);
+	    leveldb::Status  status=leveldb::DB::Open(opt2,name,&gc_db);
+	    if(!status.ok()){
+	      printf("open db on: %s  error:%s \n",name,status.ToString().c_str());
+	      exit(0);
+	      return ATOM_ERROR;
+	    }else{
+	      zab::comparator::ZabComparatorImpl * ZabCmp = new zab::comparator::ZabComparatorImpl(bucket_size);
+	      ZabCmp->gc_db=gc_db;
+	      opts.comparator = ZabCmp;
+	    }
 	  }
 	}
     }
@@ -276,6 +294,7 @@ ERL_NIF_TERM error_tuple(ErlNifEnv* env, ERL_NIF_TERM error, leveldb::Status& st
 ERL_NIF_TERM eleveldb_open(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 {
     char name[4096];
+
     if (enif_get_string(env, argv[0], name, sizeof(name), ERL_NIF_LATIN1) &&
         enif_is_list(env, argv[1]))
     {
@@ -298,6 +317,11 @@ ERL_NIF_TERM eleveldb_open(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
         memset(handle, '\0', sizeof(eleveldb_db_handle));
         handle->db = db;
         handle->options = opts;
+	if(strcmp(opts.comparator->Name(),"leveldb.ZabComparatorImpl")==0){
+	  const zab::comparator::ZabComparatorImpl * cmp =reinterpret_cast<const zab::comparator::ZabComparatorImpl *>(opts.comparator);
+	  handle->gc_db=cmp->gc_db;
+	  //handle->gc_options=opt2;
+	}
         ERL_NIF_TERM result = enif_make_resource(env, handle);
         enif_release_resource(handle);
         return enif_make_tuple2(env, ATOM_OK, result);
@@ -317,6 +341,42 @@ ERL_NIF_TERM eleveldb_get(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
         enif_is_list(env, argv[2]))
     {
         leveldb::DB* db = handle->db;
+        leveldb::Slice key_slice((const char*)key.data, key.size);
+
+        // Parse out the read options
+        leveldb::ReadOptions opts;
+        fold(env, argv[2], parse_read_option, opts);
+
+        std::string sval;
+        leveldb::Status status = db->Get(opts, key_slice, &sval);
+        if (status.ok())
+        {
+            const size_t size = sval.size();
+            ERL_NIF_TERM value_bin;
+            unsigned char* value = enif_make_new_binary(env, size, &value_bin);
+            memcpy(value, sval.data(), size);
+            return enif_make_tuple2(env, ATOM_OK, value_bin);
+        }
+        else
+        {
+            return ATOM_NOT_FOUND;
+        }
+    }
+    else
+    {
+        return enif_make_badarg(env);
+    }
+}
+
+ERL_NIF_TERM eleveldb_get_gc(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+{
+    eleveldb_db_handle* handle;
+    ErlNifBinary key;
+    if (enif_get_resource(env, argv[0], eleveldb_db_RESOURCE, (void**)&handle) &&
+        enif_inspect_binary(env, argv[1], &key) &&
+        enif_is_list(env, argv[2]))
+    {
+        leveldb::DB* db = handle->gc_db;
         leveldb::Slice key_slice((const char*)key.data, key.size);
 
         // Parse out the read options
@@ -364,6 +424,49 @@ ERL_NIF_TERM eleveldb_write(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 
             // TODO: Why does the API want a WriteBatch* versus a ref?
             leveldb::Status status = handle->db->Write(opts, &batch);
+            if (status.ok())
+            {
+                return ATOM_OK;
+            }
+            else
+            {
+                return error_tuple(env, ATOM_ERROR_DB_WRITE, status);
+            }
+        }
+        else
+        {
+            // Failed to parse out batch commands; bad item was returned from fold.
+            return enif_make_tuple2(env, ATOM_ERROR,
+                                    enif_make_tuple2(env, ATOM_BAD_WRITE_ACTION,
+                                                     result));
+        }
+    }
+    else
+    {
+        return enif_make_badarg(env);
+    }
+}
+
+ERL_NIF_TERM eleveldb_write_gc(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+{
+    eleveldb_db_handle* handle;
+    if (enif_get_resource(env, argv[0], eleveldb_db_RESOURCE, (void**)&handle) &&
+        enif_is_list(env, argv[1]) && // Actions
+        enif_is_list(env, argv[2]))   // Opts
+    {
+        // Traverse actions and build a write batch
+        leveldb::WriteBatch batch;
+        ERL_NIF_TERM result = fold(env, argv[1], write_batch_item, batch);
+        if (result == ATOM_OK)
+        {
+            // Was able to fold across all items cleanly -- apply the batch
+
+            // Parse out the write options
+            leveldb::WriteOptions opts;
+            fold(env, argv[2], parse_write_option, opts);
+
+            // TODO: Why does the API want a WriteBatch* versus a ref?
+            leveldb::Status status = handle->gc_db->Write(opts, &batch);
             if (status.ok())
             {
                 return ATOM_OK;
@@ -637,7 +740,9 @@ static void eleveldb_db_resource_cleanup(ErlNifEnv* env, void* arg)
     // Delete any dynamically allocated memory stored in eleveldb_db_handle
     eleveldb_db_handle* handle = (eleveldb_db_handle*)arg;
     delete handle->db;
-
+    if(handle->gc_db){
+      delete handle->gc_db;
+    }
     // Release any cache we explicitly allocated when setting up options
     if (handle->options.block_cache)
     {
