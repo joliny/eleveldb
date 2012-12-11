@@ -320,7 +320,6 @@ ERL_NIF_TERM eleveldb_open(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 	if(strcmp(opts.comparator->Name(),"leveldb.ZabComparatorImpl")==0){
 	  const zab::comparator::ZabComparatorImpl * cmp =reinterpret_cast<const zab::comparator::ZabComparatorImpl *>(opts.comparator);
 	  handle->gc_db=cmp->gc_db;
-	  //handle->gc_options=opt2;
 	}
         ERL_NIF_TERM result = enif_make_resource(env, handle);
         enif_release_resource(handle);
@@ -739,6 +738,8 @@ static void eleveldb_db_resource_cleanup(ErlNifEnv* env, void* arg)
 {
     // Delete any dynamically allocated memory stored in eleveldb_db_handle
     eleveldb_db_handle* handle = (eleveldb_db_handle*)arg;
+    
+
     delete handle->db;
     if(handle->gc_db){
       delete handle->gc_db;
@@ -753,6 +754,10 @@ static void eleveldb_db_resource_cleanup(ErlNifEnv* env, void* arg)
     if (handle->options.filter_policy)
     {
         delete handle->options.filter_policy;
+    }
+    //clean zab comparator
+    if(strcmp(handle->options.comparator->Name(),"leveldb.ZabComparatorImpl")==0){
+      delete handle->options.comparator;
     }
 }
 
