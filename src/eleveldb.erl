@@ -22,6 +22,7 @@
 -module(eleveldb).
 
 -export([open/2,
+         close/1,
          get/3,
          put/4,
          delete/3,
@@ -75,7 +76,8 @@ init() ->
                          {error_if_exists, boolean()} |
                          {write_buffer_size, pos_integer()} |
                          {max_open_files, pos_integer()} |
-                         {block_size, pos_integer()} |
+                         {block_size, pos_integer()} |                  %% DEPRECATED
+                         {sst_block_size, pos_integer()} |
                          {block_restart_interval, pos_integer()} |
                          {cache_size, pos_integer()} |
                          {paranoid_checks, boolean()} |
@@ -103,6 +105,10 @@ gc(_Name, _Prefix,_Start,_End) ->
 
 -spec open(string(), open_options()) -> {ok, db_ref()} | {error, any()}.
 open(_Name, _Opts) ->
+    erlang:nif_error({error, not_loaded}).
+
+-spec close(db_ref()) -> ok | {error, any()}.
+close(_Ref) ->
     erlang:nif_error({error, not_loaded}).
 
 -spec get(db_ref(), binary(), read_options()) -> {ok, binary()} | not_found | {error, any()}.
@@ -152,6 +158,8 @@ iterator_close(_IRef) ->
 
 -type fold_fun() :: fun(({Key::binary(), Value::binary()}, any()) -> any()).
 
+%% Fold over the keys and values in the database
+%% will throw an exception if the database is closed while the fold runs
 -spec fold(db_ref(), fold_fun(), any(), read_options()) -> any().
 fold(Ref, Fun, Acc0, Opts) ->
     {ok, Itr} = iterator(Ref, Opts),
@@ -159,6 +167,8 @@ fold(Ref, Fun, Acc0, Opts) ->
 
 -type fold_keys_fun() :: fun((Key::binary(), any()) -> any()).
 
+%% Fold over the keys in the database
+%% will throw an exception if the database is closed while the fold runs
 -spec fold_keys(db_ref(), fold_keys_fun(), any(), read_options()) -> any().
 fold_keys(Ref, Fun, Acc0, Opts) ->
     {ok, Itr} = iterator(Ref, Opts, keys_only),
@@ -185,7 +195,8 @@ option_types(open) ->
      {error_if_exists, bool},
      {write_buffer_size, integer},
      {max_open_files, integer},
-     {block_size, integer},
+     {block_size, integer},                            %% DEPRECATED
+     {sst_block_size, integer},
      {block_restart_interval, integer},
      {cache_size, integer},
      {paranoid_checks, bool},
@@ -223,6 +234,8 @@ do_fold(Itr, Fun, Acc0, Opts) ->
         iterator_close(Itr)
     end.
 
+fold_loop({error, iterator_closed}, _Itr, _Fun, Acc0) ->
+    throw({iterator_closed, Acc0});
 fold_loop({error, invalid_iterator}, _Itr, _Fun, Acc0) ->
     Acc0;
 fold_loop({ok, K}, Itr, Fun, Acc0) ->
@@ -287,6 +300,7 @@ destroy_test() ->
     {ok, Ref} = open("/tmp/eleveldb.destroy.test", [{create_if_missing, true}]),
     ok = ?MODULE:put(Ref, <<"def">>, <<"456">>, []),
     {ok, <<"456">>} = ?MODULE:get(Ref, <<"def">>, []),
+    close(Ref),
     ok = ?MODULE:destroy("/tmp/eleveldb.destroy.test", []),
     {error, {db_open, _}} = open("/tmp/eleveldb.destroy.test", [{error_if_exists, true}]).
 
@@ -303,16 +317,33 @@ compression_test() ->
                                                    {compression, true}]),
     [ok = ?MODULE:put(Ref1, <<I:64/unsigned>>, CompressibleData, [{sync, true}]) ||
         I <- lists:seq(1,10)],
-    %% Sum up the sizes of the .sst files in each directory -- compressed dir should
-    %% be less than uncompressed
-    Size = fun(Dir) ->
-                   lists:sum([element(2, element(2, file:read_file_info(F))) ||
-                                 F <- filelib:wildcard(filename:join(Dir, "*.sst"))])
-           end,
-    UncompressedSize = Size("/tmp/eleveldb.compress.0"),
-    CompressedSize = Size("/tmp/eleveldb.compress.1"),
-    ?assert(UncompressedSize > CompressedSize).
+	%% Check both of the LOG files created to see if the compression option was correctly
+	%% passed down
+	MatchCompressOption =
+		fun(File, Expected) ->
+				{ok, Contents} = file:read_file(File),
+				case re:run(Contents, "Options.compression: " ++ Expected) of
+					{match, _} -> match;
+					nomatch -> nomatch
+				end
+		end,
+	Log0Option = MatchCompressOption("/tmp/eleveldb.compress.0/LOG", "0"),
+	Log1Option = MatchCompressOption("/tmp/eleveldb.compress.1/LOG", "1"),
+	?assert(Log0Option =:= match andalso Log1Option =:= match).
 
+
+close_test() ->
+    os:cmd("rm -rf /tmp/eleveldb.close.test"),
+    {ok, Ref} = open("/tmp/eleveldb.close.test", [{create_if_missing, true}]),
+    ?assertEqual(ok, close(Ref)),
+    ?assertEqual({error, einval}, close(Ref)).
+
+close_fold_test() ->
+    os:cmd("rm -rf /tmp/eleveldb.close_fold.test"),
+    {ok, Ref} = open("/tmp/eleveldb.close_fold.test", [{create_if_missing, true}]),
+    ok = eleveldb:put(Ref, <<"k">>,<<"v">>,[]),
+    ?assertException(throw, {iterator_closed, ok}, % ok is returned by close as the acc
+                     eleveldb:fold(Ref, fun(_,A) -> eleveldb:close(Ref) end, undefined, [])).
 
 -ifdef(EQC).
 

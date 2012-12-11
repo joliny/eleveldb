@@ -29,36 +29,45 @@
 #include "util/zab_comparator.h"
 #include <stdio.h>
 
+#include <set>
+
 static ErlNifResourceType* eleveldb_db_RESOURCE;
 static ErlNifResourceType* eleveldb_itr_RESOURCE;
 
-typedef struct
-{
-  leveldb::DB* db;
-  leveldb::Options options;
-  leveldb::DB* gc_db;
-  leveldb::Options gc_options;
-} eleveldb_db_handle;
+struct eleveldb_itr_handle;
 
 typedef struct
 {
+    leveldb::DB* db;
+    ErlNifMutex* db_lock; // protects access to db
+    leveldb::Options options;
+    std::set<struct eleveldb_itr_handle*>* iters;
+    leveldb::DB* gc_db;
+    leveldb::Options gc_options;
+} eleveldb_db_handle;
+
+struct eleveldb_itr_handle
+{
     leveldb::Iterator*   itr;
-    ErlNifMutex*         itr_lock;
+    ErlNifMutex*         itr_lock; // acquire *after* db_lock if both needed
     const leveldb::Snapshot*   snapshot;
     eleveldb_db_handle* db_handle;
     bool keys_only;
-} eleveldb_itr_handle;
+};
+typedef struct eleveldb_itr_handle eleveldb_itr_handle;
 
 // Atoms (initialized in on_load)
 static ERL_NIF_TERM ATOM_TRUE;
 static ERL_NIF_TERM ATOM_FALSE;
 static ERL_NIF_TERM ATOM_OK;
 static ERL_NIF_TERM ATOM_ERROR;
+static ERL_NIF_TERM ATOM_EINVAL;
 static ERL_NIF_TERM ATOM_CREATE_IF_MISSING;
 static ERL_NIF_TERM ATOM_ERROR_IF_EXISTS;
 static ERL_NIF_TERM ATOM_WRITE_BUFFER_SIZE;
 static ERL_NIF_TERM ATOM_MAX_OPEN_FILES;
-static ERL_NIF_TERM ATOM_BLOCK_SIZE;
+static ERL_NIF_TERM ATOM_BLOCK_SIZE;                    /* DEPRECATED */
+static ERL_NIF_TERM ATOM_SST_BLOCK_SIZE;
 static ERL_NIF_TERM ATOM_BLOCK_RESTART_INTERVAL;
 static ERL_NIF_TERM ATOM_ERROR_DB_OPEN;
 static ERL_NIF_TERM ATOM_ERROR_DB_PUT;
@@ -93,6 +102,7 @@ static ERL_NIF_TERM ATOM_COMPARATOR_BUCKET_SIZE;
 static ErlNifFunc nif_funcs[] =
 {
     {"open", 2, eleveldb_open},
+    {"close", 1, eleveldb_close},
     {"get", 3, eleveldb_get},
     {"write", 3, eleveldb_write},
     {"iterator", 2, eleveldb_iterator},
@@ -134,9 +144,15 @@ ERL_NIF_TERM parse_open_option(ErlNifEnv* env, ERL_NIF_TERM item, leveldb::Optio
         }
         else if (option[0] == ATOM_BLOCK_SIZE) 
         { 
+            /* DEPRECATED: the old block_size atom was actually ignored. */
             unsigned long block_sz;
-            if (enif_get_ulong(env, option[1], &block_sz)) 
-                opts.block_size = block_sz;
+            enif_get_ulong(env, option[1], &block_sz); // ignore
+        }
+        else if (option[0] == ATOM_SST_BLOCK_SIZE)
+        {
+            unsigned long sst_block_sz(0);
+            if (enif_get_ulong(env, option[1], &sst_block_sz))
+             opts.block_size = sst_block_sz; // Note: We just set the "old" block_size option. 
         }
         else if (option[0] == ATOM_BLOCK_RESTART_INTERVAL) 
         { 
@@ -282,6 +298,68 @@ template <typename Acc> ERL_NIF_TERM fold(ErlNifEnv* env, ERL_NIF_TERM list,
     return ATOM_OK;
 }
 
+// Free dynamic elements of iterator - acquire lock before calling
+static void free_itr(eleveldb_itr_handle* itr_handle)
+{
+    if (itr_handle->itr)
+    {
+        delete itr_handle->itr;
+        itr_handle->itr = 0;
+        itr_handle->db_handle->db->ReleaseSnapshot(itr_handle->snapshot);
+    }
+}
+
+// Free dynamic elements of database - acquire lock before calling
+static void free_db(eleveldb_db_handle* db_handle)
+{
+    if (db_handle->db)
+    {
+        // shutdown all the iterators - grab the lock as
+        // another thread could still be in eleveldb:fold
+        // which will get {error, einval} returned next time
+        for (std::set<eleveldb_itr_handle*>::iterator iters_it = db_handle->iters->begin();
+             iters_it != db_handle->iters->end();
+             ++iters_it)
+        {
+            eleveldb_itr_handle* itr_handle = *iters_it;
+            enif_mutex_lock(itr_handle->itr_lock);
+            free_itr(*iters_it);
+            enif_mutex_unlock(itr_handle->itr_lock);
+        }
+
+        // close the db 
+        delete db_handle->db;
+        db_handle->db = NULL;
+        
+        // delete the iters
+        delete db_handle->iters;
+        db_handle->iters = NULL;
+
+        // Release any cache we explicitly allocated when setting up options
+        if (db_handle->options.block_cache)
+        {
+            delete db_handle->options.block_cache;
+        }
+        
+        // Clean up any filter policies
+        if (db_handle->options.filter_policy)
+        {
+            delete db_handle->options.filter_policy;
+        }
+	if(strcmp(db_handle->options.comparator->Name(),"leveldb.ZabComparatorImpl")==0){
+	  delete db_handle->options.comparator;
+	}
+	 if(db_handle->gc_db){
+	   delete db_handle->gc_db;
+	 }
+    }
+}
+
+
+ERL_NIF_TERM error_einval(ErlNifEnv* env)
+{
+    return enif_make_tuple2(env, ATOM_ERROR, ATOM_EINVAL);
+}
 
 ERL_NIF_TERM error_tuple(ErlNifEnv* env, ERL_NIF_TERM error, leveldb::Status& status)
 {
@@ -316,14 +394,42 @@ ERL_NIF_TERM eleveldb_open(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
                                                        sizeof(eleveldb_db_handle));
         memset(handle, '\0', sizeof(eleveldb_db_handle));
         handle->db = db;
+        handle->db_lock = enif_mutex_create((char*)"eleveldb_db_lock");
         handle->options = opts;
 	if(strcmp(opts.comparator->Name(),"leveldb.ZabComparatorImpl")==0){
 	  const zab::comparator::ZabComparatorImpl * cmp =reinterpret_cast<const zab::comparator::ZabComparatorImpl *>(opts.comparator);
 	  handle->gc_db=cmp->gc_db;
 	}
+        handle->iters = new std::set<struct eleveldb_itr_handle*>();
         ERL_NIF_TERM result = enif_make_resource(env, handle);
         enif_release_resource(handle);
         return enif_make_tuple2(env, ATOM_OK, result);
+    }
+    else
+    {
+        return enif_make_badarg(env);
+    }
+}
+
+ERL_NIF_TERM eleveldb_close(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+{
+    eleveldb_db_handle* db_handle;
+    if (enif_get_resource(env, argv[0], eleveldb_db_RESOURCE, (void**)&db_handle))
+    {
+        ERL_NIF_TERM result;
+
+        enif_mutex_lock(db_handle->db_lock);
+        if (db_handle->db)
+        {
+            free_db(db_handle);
+            result = ATOM_OK;
+        }
+        else
+        {
+            result = error_einval(env);
+        }
+        enif_mutex_unlock(db_handle->db_lock);
+        return result;
     }
     else
     {
@@ -339,6 +445,13 @@ ERL_NIF_TERM eleveldb_get(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
         enif_inspect_binary(env, argv[1], &key) &&
         enif_is_list(env, argv[2]))
     {
+        enif_mutex_lock(handle->db_lock);
+        if (handle->db == NULL)
+        {
+            enif_mutex_unlock(handle->db_lock);
+            return error_einval(env);
+        }
+
         leveldb::DB* db = handle->db;
         leveldb::Slice key_slice((const char*)key.data, key.size);
 
@@ -354,10 +467,12 @@ ERL_NIF_TERM eleveldb_get(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
             ERL_NIF_TERM value_bin;
             unsigned char* value = enif_make_new_binary(env, size, &value_bin);
             memcpy(value, sval.data(), size);
+            enif_mutex_unlock(handle->db_lock);
             return enif_make_tuple2(env, ATOM_OK, value_bin);
         }
         else
         {
+            enif_mutex_unlock(handle->db_lock);
             return ATOM_NOT_FOUND;
         }
     }
@@ -410,6 +525,13 @@ ERL_NIF_TERM eleveldb_write(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
         enif_is_list(env, argv[1]) && // Actions
         enif_is_list(env, argv[2]))   // Opts
     {
+        enif_mutex_lock(handle->db_lock);
+        if (handle->db == NULL)
+        {
+            enif_mutex_unlock(handle->db_lock);
+            return error_einval(env);
+        }
+
         // Traverse actions and build a write batch
         leveldb::WriteBatch batch;
         ERL_NIF_TERM result = fold(env, argv[1], write_batch_item, batch);
@@ -425,15 +547,18 @@ ERL_NIF_TERM eleveldb_write(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
             leveldb::Status status = handle->db->Write(opts, &batch);
             if (status.ok())
             {
+                enif_mutex_unlock(handle->db_lock);
                 return ATOM_OK;
             }
             else
             {
+                enif_mutex_unlock(handle->db_lock);
                 return error_tuple(env, ATOM_ERROR_DB_WRITE, status);
             }
         }
         else
         {
+            enif_mutex_unlock(handle->db_lock);
             // Failed to parse out batch commands; bad item was returned from fold.
             return enif_make_tuple2(env, ATOM_ERROR,
                                     enif_make_tuple2(env, ATOM_BAD_WRITE_ACTION,
@@ -495,6 +620,13 @@ ERL_NIF_TERM eleveldb_iterator(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv
     if (enif_get_resource(env, argv[0], eleveldb_db_RESOURCE, (void**)&db_handle) &&
         enif_is_list(env, argv[1])) // Options
     {
+        enif_mutex_lock(db_handle->db_lock);
+        if (db_handle->db == NULL)
+        {
+            enif_mutex_unlock(db_handle->db_lock);
+            return error_einval(env);
+        }
+
         // Increment references to db_handle for duration of the iterator
         enif_keep_resource(db_handle);
 
@@ -521,6 +653,9 @@ ERL_NIF_TERM eleveldb_iterator(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv
 
         ERL_NIF_TERM result = enif_make_resource(env, itr_handle);
         enif_release_resource(itr_handle);
+
+        db_handle->iters->insert(itr_handle);
+        enif_mutex_unlock(db_handle->db_lock);
         return enif_make_tuple2(env, ATOM_OK, result);
     }
     else
@@ -611,17 +746,24 @@ ERL_NIF_TERM eleveldb_iterator_close(ErlNifEnv* env, int argc, const ERL_NIF_TER
     eleveldb_itr_handle* itr_handle;
     if (enif_get_resource(env, argv[0], eleveldb_itr_RESOURCE, (void**)&itr_handle))
     {
+        // Make sure locks are acquired in the same order to close/free_db
+        // to avoid a deadlock.
+        enif_mutex_lock(itr_handle->db_handle->db_lock);
         enif_mutex_lock(itr_handle->itr_lock);
 
-        if (itr_handle->itr != 0)
+        if (itr_handle->db_handle->iters)
         {
-            delete itr_handle->itr;
-            itr_handle->itr = 0;
-            itr_handle->db_handle->db->ReleaseSnapshot(itr_handle->snapshot);
-            enif_release_resource(itr_handle->db_handle);
+            // db may have been closed before the iter (the unit test
+            // does an evil close-inside-fold)
+            itr_handle->db_handle->iters->erase(itr_handle);
         }
+        free_itr(itr_handle);
 
         enif_mutex_unlock(itr_handle->itr_lock);
+        enif_mutex_unlock(itr_handle->db_handle->db_lock);
+
+        enif_release_resource(itr_handle->db_handle); // matches keep in eleveldb_iterator()
+
         return ATOM_OK;
     }
     else
@@ -637,6 +779,13 @@ ERL_NIF_TERM eleveldb_status(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]
     if (enif_get_resource(env, argv[0], eleveldb_db_RESOURCE, (void**)&db_handle) &&
         enif_inspect_binary(env, argv[1], &name_bin))
     {
+        enif_mutex_lock(db_handle->db_lock);
+        if (db_handle->db == NULL)
+        {
+            enif_mutex_unlock(db_handle->db_lock);
+            return error_einval(env);
+        }
+
         leveldb::Slice name((const char*)name_bin.data, name_bin.size);
         std::string value;
         if (db_handle->db->GetProperty(name, &value))
@@ -644,10 +793,12 @@ ERL_NIF_TERM eleveldb_status(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]
             ERL_NIF_TERM result;
             unsigned char* result_buf = enif_make_new_binary(env, value.size(), &result);
             memcpy(result_buf, value.c_str(), value.size());
+            enif_mutex_unlock(db_handle->db_lock);
             return enif_make_tuple2(env, ATOM_OK, result);
         }
         else
         {
+            enif_mutex_unlock(db_handle->db_lock);
             return ATOM_ERROR;
         }
     }
@@ -712,6 +863,13 @@ ERL_NIF_TERM eleveldb_is_empty(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv
     eleveldb_db_handle* db_handle;
     if (enif_get_resource(env, argv[0], eleveldb_db_RESOURCE, (void**)&db_handle))
     {
+        enif_mutex_lock(db_handle->db_lock);
+        if (db_handle->db == NULL)
+        {
+            enif_mutex_unlock(db_handle->db_lock);
+            return error_einval(env);
+        }
+
         leveldb::ReadOptions opts;
         leveldb::Iterator* itr = db_handle->db->NewIterator(opts);
         itr->SeekToFirst();
@@ -725,6 +883,7 @@ ERL_NIF_TERM eleveldb_is_empty(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv
             result = ATOM_TRUE;
         }
         delete itr;
+        enif_mutex_unlock(db_handle->db_lock);
         return result;
     }
     else
@@ -738,39 +897,29 @@ static void eleveldb_db_resource_cleanup(ErlNifEnv* env, void* arg)
 {
     // Delete any dynamically allocated memory stored in eleveldb_db_handle
     eleveldb_db_handle* handle = (eleveldb_db_handle*)arg;
-    
+    free_db(handle);
 
-    delete handle->db;
-    if(handle->gc_db){
-      delete handle->gc_db;
-    }
-    // Release any cache we explicitly allocated when setting up options
-    if (handle->options.block_cache)
-    {
-        delete handle->options.block_cache;
-    }
-
-    // Clean up any filter policies
-    if (handle->options.filter_policy)
-    {
-        delete handle->options.filter_policy;
-    }
-    //clean zab comparator
-    if(strcmp(handle->options.comparator->Name(),"leveldb.ZabComparatorImpl")==0){
-      delete handle->options.comparator;
-    }
+    enif_mutex_destroy(handle->db_lock);
 }
 
 static void eleveldb_itr_resource_cleanup(ErlNifEnv* env, void* arg)
 {
     // Delete any dynamically allocated memory stored in eleveldb_itr_handle
     eleveldb_itr_handle* itr_handle = (eleveldb_itr_handle*)arg;
+
+    // No need to lock iter - it's the last reference
     if (itr_handle->itr != 0)
     {
-        delete itr_handle->itr;
-        itr_handle->itr = 0;
-        itr_handle->db_handle->db->ReleaseSnapshot(itr_handle->snapshot);
-        enif_release_resource(itr_handle->db_handle);
+        enif_mutex_lock(itr_handle->db_handle->db_lock);
+
+        if (itr_handle->db_handle->iters)
+        {
+            itr_handle->db_handle->iters->erase(itr_handle);
+        }
+        free_itr(itr_handle);
+
+        enif_mutex_unlock(itr_handle->db_handle->db_lock);
+        enif_release_resource(itr_handle->db_handle);  // matches keep in eleveldb_iterator()
     }
 
     enif_mutex_destroy(itr_handle->itr_lock);
@@ -791,6 +940,7 @@ static int on_load(ErlNifEnv* env, void** priv_data, ERL_NIF_TERM load_info)
     // Initialize common atoms
     ATOM(ATOM_OK, "ok");
     ATOM(ATOM_ERROR, "error");
+    ATOM(ATOM_EINVAL, "einval");
     ATOM(ATOM_TRUE, "true");
     ATOM(ATOM_FALSE, "false");
     ATOM(ATOM_CREATE_IF_MISSING, "create_if_missing");
@@ -798,6 +948,7 @@ static int on_load(ErlNifEnv* env, void** priv_data, ERL_NIF_TERM load_info)
     ATOM(ATOM_WRITE_BUFFER_SIZE, "write_buffer_size");
     ATOM(ATOM_MAX_OPEN_FILES, "max_open_files");
     ATOM(ATOM_BLOCK_SIZE, "block_size");
+    ATOM(ATOM_SST_BLOCK_SIZE, "sst_block_size");
     ATOM(ATOM_BLOCK_RESTART_INTERVAL, "block_restart_interval");
     ATOM(ATOM_ERROR_DB_OPEN,"db_open");
     ATOM(ATOM_ERROR_DB_PUT, "db_put");
